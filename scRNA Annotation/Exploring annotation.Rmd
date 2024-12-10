@@ -1,0 +1,342 @@
+---
+title: "Exploring Annotation"
+author: "Sifan Zhang"
+date: "2024-12-09"
+output: html_document
+---
+
+**In this workflow we will compare unsupervised annotation with reference-based annotation**
+**For reference annotation we will use Azimuth pipeline**
+**guidelines can be found in [Azimuth annotation](https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html)**
+
+# Prepare  r packages
+"azimuth" and "SeuratData" need to be downloaded from github, it's for reference annonation. Downloading could pop up errors, just keep trying installing packages that's missing. 
+
+`devtools::install_github("satijalab/seurat", "seurat5")`
+`devtools::install_github("satijalab/seurat-data", "seurat5")`
+`remotes::install_github('satijalab/azimuth', ref = 'master')`
+
+```{r libraries, warning=FALSE, message = FALSE}
+library(devtools)
+library(remotes)
+library(SeuratData)
+library(SeuratWrappers)
+library(Azimuth)
+library(SeuratObject)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(reshape2)
+library(pheatmap)
+```
+
+
+# Set up R environment
+including working directory, this depends on your own laptop.
+For MacOs users you can just copy and paste working directory, for Windows users you need to change backslash to forward slash
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message=F, warning=F)
+
+# sets the directory of all chunks to the directory of this script
+knitr::opts_knit$set(root.dir = "M:/SifanZ/OneDrive - Westmead Institute for Medical Research/Data/scRNA_LN/GSE254435")
+
+theme_set(theme_classic())
+set.seed(1337)
+```
+
+# Load a integerated seurat object, use dot plot to visualize marker gene expression
+
+```{r dataloading}
+data <- readRDS("data/integrated.rds")
+
+DefaultAssay(data) <- "RNA"
+Markers <- c('CD3E','CD4','CD8A','SELL','CCR7','TCF7','GATA3','CCR4','CXCR3','KLRG1','RORC','CCR6','CXCR5','PDCD1','ICOS',
+            'CD40LG','FOXP3','IL2RA','OAS1','ISG15','IFI44L','GZMA','GZMB','GZMH','GZMM','TRDV2','TRAV1-2','KLRB1','SLC4A10',
+            'NKG7', 'FCGR3A','NCAM1','CD19','MS4A1','IGHM','FCRL5','IRF4','PRDM1','CD38','CST3','LYZ','CD14','CLEC4C','IL3RA',
+            'XCR1', 'CLEC9A','CD1C','FCER1A','IL7R','IL18R1','IL23R','CD34','MKI67')
+DotPlot(data, features = Markers, dot.min = 0, dot.scale = 2) +coord_flip() + 
+  theme(axis.text = element_text(size = 5)) 
+new.cluster.ids <- c(`0` = "Th2_CD4_Tcm", 
+                     `1` = "Th17_CD4_Tcm",
+                     `2` = "CD14_Mono", 
+                     `3` = "CD4_Tcm", 
+                     `4` = "CD16_NK",
+                     `5` = "IgM_B_mem",
+                     `6` = "switched_B_mem",
+                     `7` = "Treg_CD4", 
+                     `8` = "CD8_cytotoxic", 
+                     `9` = "Th2_CD4_Tcm",
+                     `10` = "CD8_Tcm",
+                     `11` = "vd2_gdT",
+                     `12` = "MAIT",
+                     `13` = "CD56_NK",
+                     `14` = "CD14_Mono",
+                     `15` = "CD16_Mono",
+                     `16` = "Th2_CD4_Tcm",
+                     `17` = "doublets",
+                     `18` = "ISG_CD4",
+                     `19` = "Tfh_CD4",
+                     `20` = "pDC",
+                     `21` = "Mixed_T_NK",
+                     `22` = "cDC1_cDC2",
+                     `23` = "B_Naive",
+                     `24` = "cycling",
+                     `25` = "ILC",
+                     `26` = "CD56low_CD16_NK",
+                     `27` = "CXCR3_CD4_Tcm",
+                     `28` = "plasmablast",
+                     `29` = "HSPC",
+                     `30` = "FCRL5_B_mem"
+                     )
+names(new.cluster.ids) <- levels(data)
+data <- RenameIdents(data, new.cluster.ids)
+DimPlot(data, reduction = "umap", label = TRUE, label.size = 2.5) + NoLegend()
+head(data@meta.data)
+```
+
+# Subcluster DCs
+
+Note that at this point DCs can't be separated into cDC1 and cDC2, so we need to do subclustering
+
+```{r subcluster}
+sub.cells <- subset(data, idents = "cDC1_cDC2")
+DefaultAssay(sub.cells)<-"RNA"
+f = "obj.Rdata"
+if(!file.exists(f)){
+  sub.cells = sub.cells %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData(features = c('CLEC9A','XCR1','FCER1A','CD1C')) %>%
+  RunPCA(features = c('CLEC9A','XCR1','FCER1A','CD1C'))  %>%
+  FindNeighbors(dims = 1:45) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:45) 
+  save(sub.cells,file = f)
+}
+load(f)
+DimPlot(sub.cells, reduction = 'umap',label = T)+NoLegend()
+sub.cells
+
+#Visualize marker genes
+DefaultAssay(sub.cells)<-"RNA"
+DC_markers<-c('CLEC9A','XCR1','FCER1A','CD1C')
+DotPlot(sub.cells,features = DC_markers) + RotatedAxis()
+
+#Annotate and put back to big umap
+sub.cells@meta.data$annotation <- ifelse(sub.cells@meta.data$seurat_clusters == 0, "cDC2", "cDC1")
+head(sub.cells@meta.data)
+data@meta.data$annotation = as.character(Idents(data))
+data@meta.data$annotation = ifelse(data@meta.data$annotation=="cDC1_cDC2",
+       sub.cells@meta.data$annotation[match(colnames(data@meta.data),colnames(sub.cells@meta.data))],
+       data@meta.data$annotation)
+Idents(data) = data@meta.data$annotation
+DimPlot(data,reduction = "umap", label = T, label.size = 2.5)
+table(data@meta.data$annotation)
+
+DotPlot(data, features = Markers, dot.min = 0, dot.scale = 2) +coord_flip() + 
+  theme(axis.text = element_text(size = 5)) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+saveRDS(data,"data/alldata_annotated.rds")
+```
+
+# Compare Azimuth annotation with unsupervised annotation
+If the internet connection is poor, you may need to manually download reference to working directory and install it.
+`install.packages("tonsilref.SeuratData_2.0.0.tar.gz", repos = NULL, type = "source")`
+Since I have two sample type (blood and lymph node), I tried two reference, PBMC and tonsil.
+
+# PBMC reference
+
+```{r Azimuth PBMC}
+data<-readRDS("data/alldata_annotated.rds")
+
+DefaultAssay(data)<-"RNA"
+data_pbmc_ref<-RunAzimuth(data, reference = "pbmcref")
+head(data_pbmc_ref@meta.data)
+data_pbmc_ref
+p1<-DimPlot(data_pbmc_ref, reduction = "umap", group.by = "predicted.celltype.l2", label = TRUE, label.size = 2.5) + 
+  NoLegend() + theme(aspect.ratio = 1) 
+p2<-DimPlot(data, reduction = "umap", label = T, label.size = 2.5) +ggtitle("unsupervised annotation") + 
+  NoLegend() + theme(aspect.ratio = 1)
+p1+p2
+
+meta.data1 <- data_pbmc_ref@meta.data[, c("annotation", "predicted.celltype.l2")]
+meta.data1 <- meta.data1 %>%
+  rename(pbmc.predicted.celltype = predicted.celltype.l2)
+
+metadata_long1 <- meta.data1 %>%
+  pivot_longer(cols = c("annotation", "pbmc.predicted.celltype"), 
+               names_to = "Type", values_to = "CellType") 
+
+counts1 <- metadata_long1 %>%
+  group_by(Type, CellType) %>%
+  summarise(Count = n(), .groups = "drop")
+
+ggplot(counts1, aes(x = Type, y = Count, fill = CellType)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_minimal() +
+  labs(x = "Annotation Type", y = "Number of Barcodes", fill = "Cell Type", title = "Mapping of Cell Types") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(size = 5),  # Adjust legend text size
+    legend.title = element_text(size = 10),  # Adjust legend title size
+    legend.key.size = unit(0.5, "cm"),      # Adjust legend key size
+    legend.position = "right",              # Position legend to the right
+    plot.margin = margin(10, 10, 10, 10),   # Adjust plot margins for more space
+    axis.title = element_text(size = 12),   # Increase axis title size (optional)
+    axis.text = element_text(size = 10)     # Adjust axis text size (optional)
+  )
+
+table(data_pbmc_ref@meta.data$annotation)
+table(data_pbmc_ref@meta.data$predicted.celltype.l2)
+
+heatmap_data <- dcast(data_pbmc_ref@meta.data, annotation ~ predicted.celltype.l2, value.var = "predicted.celltype.l2.score", fun.aggregate = mean, na.rm = TRUE)
+rownames(heatmap_data) <- heatmap_data$annotation
+cell_scores_matrix <- as.matrix(heatmap_data[, -1])
+cell_scores_matrix[is.na(cell_scores_matrix)] <- 0
+head(cell_scores_matrix)
+pheatmap(cell_scores_matrix, 
+         cluster_rows = TRUE,     # Cluster cell types (rows)
+         cluster_cols = TRUE,     # Cluster conditions (columns)
+         scale = "none",          # Optionally scale the data (e.g., "row" for row normalization)
+         color = colorRampPalette(c("blue", "white", "red"))(100),  # Adjust color palette
+         na_col = "grey",         # Color for missing values (NA)
+         main = "Cell Type Score Heatmap",
+         fontsize_row = 6,         
+         fontsize_col = 10,        
+         angle_col = 45 
+)
+
+```
+
+
+# Tonsil
+
+```{r Azimuth Tonsil}
+DefaultAssay(data)<-"RNA"
+data_tonsil_ref<-RunAzimuth(data, reference = "tonsilref")
+head(data_tonsil_ref@meta.data)
+data_tonsil_ref
+p3<-DimPlot(data_tonsil_ref, reduction = "umap", group.by = "predicted.celltype.l1", label = TRUE, label.size = 2.5) + 
+  NoLegend() + theme(aspect.ratio = 1) 
+p4<-DimPlot(data, reduction = "umap", label = T, label.size = 2.5) + ggtitle("unsupervised annotation") + 
+  NoLegend() + theme(aspect.ratio = 1) 
+p3+p4
+
+meta.data2 <- data_tonsil_ref@meta.data[, c("annotation", "predicted.celltype.l1")]
+meta.data2 <- meta.data2 %>%
+  rename(tonsil.predicted.celltype = predicted.celltype.l1)
+
+metadata_long2 <- meta.data2 %>%
+  pivot_longer(cols = c("annotation", "tonsil.predicted.celltype"), 
+               names_to = "Type", values_to = "CellType") 
+
+counts2 <- metadata_long2 %>%
+  group_by(Type, CellType) %>%
+  summarise(Count = n(), .groups = "drop")
+
+ggplot(counts2, aes(x = Type, y = Count, fill = CellType)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_minimal() +
+  labs(x = "Annotation Type", y = "Number of Barcodes", fill = "Cell Type", title = "Mapping of Cell Types") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(size = 5),  # Adjust legend text size
+    legend.title = element_text(size = 10),  # Adjust legend title size
+    legend.key.size = unit(0.5, "cm"),      # Adjust legend key size
+    legend.position = "right",              # Position legend to the right
+    plot.margin = margin(10, 10, 10, 10),   # Adjust plot margins for more space
+    axis.title = element_text(size = 12),   # Increase axis title size (optional)
+    axis.text = element_text(size = 10)     # Adjust axis text size (optional)
+  )
+
+table(data_tonsil_ref@meta.data$annotation)
+table(data_tonsil_ref@meta.data$predicted.celltype.l1)
+
+heatmap_data <- dcast(data_tonsil_ref@meta.data, annotation ~ predicted.celltype.l1, value.var = "predicted.celltype.l1.score", fun.aggregate = mean, na.rm = TRUE)
+rownames(heatmap_data) <- heatmap_data$annotation
+cell_scores_matrix <- as.matrix(heatmap_data[, -1])
+cell_scores_matrix[is.na(cell_scores_matrix)] <- 0
+head(cell_scores_matrix)
+pheatmap(cell_scores_matrix, 
+         cluster_rows = TRUE,     # Cluster cell types (rows)
+         cluster_cols = TRUE,     # Cluster conditions (columns)
+         scale = "none",          # Optionally scale the data (e.g., "row" for row normalization)
+         color = colorRampPalette(c("blue", "white", "red"))(100),  # Adjust color palette
+         na_col = "grey",         # Color for missing values (NA)
+         main = "Cell Type Score Heatmap",
+         fontsize_row = 6,         
+         fontsize_col = 8,        
+         angle_col = 45 
+)
+
+saveRDS(data_pbmc_ref, "data/data_pbmc_ref.rds")
+saveRDS(data_tonsil_ref, "data/data_tonsil_ref.rds")
+
+```
+
+# Annotate DC subclusters using new annotation
+I think using PBMC reference gives a better annotation of DC subsets, but I don't want to lose other annotations.
+So I will replace DC cells with new annotations, but keep the other cell types unchanged
+```{r}
+Idents(data_pbmc_ref)<-data_pbmc_ref@meta.data$predicted.celltype.l2
+DotPlot(data_pbmc_ref, features = Markers, dot.min = 0, dot.scale = 2) +coord_flip() + 
+  theme(axis.text = element_text(size = 5)) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ggtitle("predicted cell type")
+
+data_pbmc_ref@meta.data$annotation[
+  data_pbmc_ref@meta.data$predicted.celltype.l2 %in% c("cDC1", "cDC2")
+] <- data_pbmc_ref@meta.data$predicted.celltype.l2[
+  data_pbmc_ref@meta.data$predicted.celltype.l2 %in% c("cDC1", "cDC2")
+]
+
+Idents(data_pbmc_ref) <- data_pbmc_ref@meta.data$annotation
+Idents(data_pbmc_ref) <- factor(Idents(data_pbmc_ref), levels = c("CD4_Tcm", 
+                                                                  "Th2_CD4_Tcm", 
+                                                                  "CXCR3_CD4_Tcm",
+                                                                  "Th17_CD4_Tcm",
+                                                                  "Tfh_CD4",
+                                                                  "Treg_CD4",
+                                                                  "ISG_CD4",
+                                                                  "CD8_Tcm",
+                                                                  "CD8_cytotoxic",
+                                                                  "vd2_gdT",
+                                                                  "MAIT",
+                                                                  "CD16_NK",
+                                                                  "CD56_NK",
+                                                                  "CD56low_CD16_NK",
+                                                                  "Mixed_T_NK",
+                                                                  "IgM_B_mem",
+                                                                  "switched_B_mem",
+                                                                  "B_Naive",
+                                                                  "FCRL5_B_mem",
+                                                                  "plasmablast",
+                                                                  "CD14_Mono",
+                                                                  "CD16_Mono",
+                                                                  "pDC",
+                                                                  "cDC1",
+                                                                  "cDC2",
+                                                                  "ILC",
+                                                                  "HSPC",
+                                                                  "cycling",
+                                                                  "doublets"))
+
+
+DotPlot(data_pbmc_ref, features = Markers, dot.min = 0, dot.scale = 2.5) +coord_flip() + 
+  theme(axis.text = element_text(size = 5)) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ggtitle("unsupervised annotation")
+
+p5<-DimPlot(data_pbmc_ref, reduction = "umap", group.by = "predicted.celltype.l2", label = TRUE, label.size = 2.5) + 
+  NoLegend() + theme(aspect.ratio = 1) 
+p6<-DimPlot(data_pbmc_ref, reduction = "umap", group.by = "annotation", label = TRUE, label.size = 2.5) + 
+  NoLegend() + theme(aspect.ratio = 1) + ggtitle("unsupervised annotation")
+p5+p6
+
+```
+
+# Session info
+```{r session info}
+sessionInfo()
+```
