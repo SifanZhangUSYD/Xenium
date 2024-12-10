@@ -1,0 +1,339 @@
+---
+title: "Integrate_annotation_Xenium_reference"
+author: "Sifan Zhang"
+date: "2024-12-02"
+output: html_document
+---
+
+**This .Rmd will go through how to load and integrate public datasets from NCBI and write integrated seurat object into format required by Xenium Custom Panel Designer.**
+
+**The reason we are doing this: The features.tsv.gv file contains two coloums, ensmble ID and gene ID, the default setting of read10x funtion is to use gene ID as gene name because it makes more biological sense. But if you need to write MEX file in a later point (for example, use it as a reference dataset for Xenium panel designer), you will need ensmble ID.**
+
+**The aim of this workflow is to store full gene info including ensembl ID and gene ID in assays$RNA@meta.data, which used to be meta.features in seurat v3. So the DropletUtils package can work properly to write a integrated seurat object to MEX format.**
+
+**One thing to know before doing this: you may want to upload single, pre-QC datasets if you want all genes to be there. In this case you can jump batch loading sample, QC and integration, just annotate samples one by one, and write MEX files for multiple reference datasets. The maximum datasets for Xenium panel designer is 5. If you want a reference dataset that can include comprehensive clusters, you can integrate the samples and upload it as one reference dataset**
+
+
+
+# Prepare  r packages
+Note that "SeuratObject" and "Seurat" are necessary for processing 10x single cell dataset to a seurat object.
+
+"GEOquery" need to be downloaded from BiocManager first, it's for read raw data from NCBI database.
+
+"DropletUtils" need to be downloaded from BiocManager first, it's for writing seurat object back to MEX format that Xenium requires.
+
+"harmony" is for data integration.
+ 
+```{r libraries, warning=FALSE, message = FALSE}
+library(devtools)
+library(remotes)
+library(DropletUtils)
+library(GEOquery)
+library(SeuratObject)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(harmony)
+library(tidyr)
+library(RColorBrewer)
+```
+
+
+# Set up R environment
+including working directory, this depends on your own laptop.
+For MacOs users you can just copy and paste working directory, for Windows users you need to change backslash to forward slash
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message=F, warning=F)
+
+# sets the directory of all chunks to the directory of this script
+knitr::opts_knit$set(root.dir = "M:/SifanZ/OneDrive - Westmead Institute for Medical Research/Data/scRNA_LN/GSE254435")
+
+theme_set(theme_classic())
+set.seed(1337)
+```
+
+The data is derived from [Fine needle aspiration of human lymph nodes](https://onlinelibrary.wiley.com/doi/full/10.1002/eji.202350872).
+
+## Downloading and loading data into Seurat
+
+```{r download data, eval=F}
+pDir = getwd()
+if(!dir.exists("raw")){dir.create("raw")}
+if(!dir.exists("data")){dir.create("data")}
+
+#download the data from the GEO
+download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE254435&format=file", 
+             destfile = "GSE254435.tar", 
+             method = "curl")
+
+#untar data into a new folder called "raw"
+untar("GSE254435.tar", exdir = "raw")
+```
+# Collect the submitted metadata for each sample
+
+```{r metadata}
+
+gse <- pData(GEOquery::getGEO("GSE254435")[[1]])
+gse$donor <- sub(".*donor (\\d+)", "donor \\1", gse$title)
+saveRDS(gse, "data/gse,rds")
+```
+
+# Create a new folder for data and load in the names of the files we downloaded
+
+```{r files}
+mats = list.files("raw/", pattern= ".mtx")
+bars = list.files("raw/", pattern= ".barcode")
+feats = list.files("raw/", pattern= ".feat")
+```
+
+# Load multiple data
+
+```{r mergeData, eval=F}
+setwd("raw")
+seu_list <- list()
+for(i in 1:nrow(gse)){
+  
+  mat = readMM(grep(rownames(gse)[i], mats, value=T))
+  feat = read.delim(grep(rownames(gse)[i], feats, value=T), header=F)
+  bar = read.delim(grep(rownames(gse)[i], bars, value=T), header=F)
+  
+  feat$V4 <- make.unique(feat$V2, sep="-")
+  
+  rownames(mat) <- feat$V4 #rownames = genes
+  colnames(mat) <- bar$V1 #colnames = barcodes
+  
+  #generate the metadata file using information from the gse object
+  met <- data.frame(row.names = bar$V1)
+  met$sample <- gse$`title`[i]
+  met$tissue <- gse$`tissue:ch1`[i]
+  met$donor <- gse$`donor`[i]
+  
+  #create seurat object
+  seu <- CreateSeuratObject(mat, meta.data = met)
+  
+  # feature metadata
+  seu@assays$RNA@meta.data
+  seu@assays$RNA@meta.data$geneID <- feat$V2
+  seu@assays$RNA@meta.data$geneID_Unique <- feat$V4
+  seu@assays$RNA@meta.data$ensembl <- feat$V1
+  
+  seu$percent.mt <- PercentageFeatureSet(seu, features=rownames(seu)[grep("MT-", seu@assays$RNA@meta.data$geneID)])
+  #  number of genes and number of transcripts
+  seu$filter = ifelse(seu$nCount_RNA>900 & seu$nFeature_RNA>1300 & seu$percent.mt<6.5, 
+                      "keep", 
+                      'throw')
+
+  seu <- subset(seu, subset = filter == "keep")
+  seu_list[[i]] <- seu
+}
+seu <- Reduce(function(x, y) merge(x, y), seu_list)
+
+#rm(bar,feat,mat,met, bars, feats, i, mats, zeroes)
+setwd(pDir)
+seu[["RNA"]] <- JoinLayers(seu[["RNA"]])
+
+zeroes <- rowSums(seu@assays$RNA@layers$counts!=0) # counts the number of non-zeros per row. 
+seu <- seu[zeroes>=10,]
+
+saveRDS(seu, "data/all_data_unint.rds")
+```
+
+```{r CheckInt}
+data <- readRDS("data/all_data_unint.rds")
+data
+head(data@meta.data)
+head(data@assays$RNA@meta.data)
+FeatureScatter(data, "nFeature_RNA", "nCount_RNA", group.by='sample', pt.size=0.1)+
+  geom_vline(xintercept = 1300)+
+  geom_hline(yintercept = 900)
+```
+
+# Performing the integration 
+here, we'll use harmony and integrate per donor, dims=45, resolution = 1.2 because its what the paper use. Just to reproduce the figure.
+Integration using Seurat v5 can be found in https://satijalab.org/seurat/articles/seurat5_integration
+
+```{r, eval=F}
+options(future.globals.maxSize = 3 * 1024^3)  # 3 GiB
+
+data[["RNA"]] <- split(data[["RNA"]], f = data$donor)
+
+data <- NormalizeData(data,verbose=F)
+data <- FindVariableFeatures(data,verbose=F)
+data <- ScaleData(data,verbose=F)
+data <- RunPCA(data,verbose=F)
+
+# checking unintegrated analysis
+data <- FindNeighbors(data, dims = 1:45, reduction = "pca",verbose=F)
+data <- FindClusters(data, resolution = 1.2, cluster.name = "unintegrated_clusters",verbose=F)
+data <- RunUMAP(data, dims = 1:45, reduction = "pca", reduction.name = "umap.unintegrated",verbose=F)
+#integrating data
+data <- IntegrateLayers(object = data, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony",
+    verbose = T)
+data[["RNA"]] <- JoinLayers(data[["RNA"]])
+
+data <- FindNeighbors(data, reduction = "harmony", dims = 1:45,verbose=F)
+data <- FindClusters(data, resolution = 1.2,verbose=F)
+data <- RunUMAP(data, dims = 1:45, reduction = "harmony",verbose=F)
+
+
+saveRDS(data,"data/integrated.rds")
+```
+# Comparison between unintegrated vs. integrated 
+```{r}
+data <- readRDS("data/integrated.rds")
+
+plot_grid(
+  DimPlot(data, reduction = "umap", group.by = "donor", label=T)+ggtitle("harmony"),
+  DimPlot(data, reduction = "umap.unintegrated", group.by = "donor", label=T)+ggtitle("No Int")
+)
+  DimPlot(data, reduction = "umap", label=T)+NoLegend()
+  
+FetchData(data, c("ident","sample")) %>% group_by(ident) %>%
+    mutate(prop=1/length(ident)) %>%
+    ungroup() %>%
+    group_by(ident,sample) %>%
+    summarise(totprop=sum(prop), .groups = "drop") %>%
+    ggplot(aes(x=ident,fill=sample,y=totprop)) +
+    geom_bar(position='fill', stat='identity') + 
+    theme(axis.text.x =element_text(angle = 45,hjust=1))+scale_y_continuous(name="Cluster Proportion")+ theme_classic()
+
+FetchData(data, c("ident","donor")) %>% group_by(ident) %>%
+    mutate(prop=1/length(ident)) %>%
+    ungroup() %>%
+    group_by(ident,donor) %>%
+    summarise(totprop=sum(prop),.groups = "drop") %>%
+    ggplot(aes(x=ident,fill=donor,y=totprop)) +
+    geom_bar(position='fill', stat='identity') + 
+    theme(axis.text.x =element_text(angle = 45,hjust=1))+scale_y_continuous(name="Cluster Proportion")+ theme_classic()
+
+
+```
+
+# Use Dotplot to visualize gene expression, and annotate clusters 
+note: always set default assay to 'RNA' when looking at gene expression
+From the UMAP we can see the current resolution can't seperate cDC1 and cDC2, needs to be improved later
+```{r}
+DefaultAssay(data) <- "RNA"
+Markers <- c('CD3E','CD4','CD8A','SELL','CCR7','TCF7','GATA3','CCR4','CXCR3','KLRG1','RORC','CCR6','CXCR5','PDCD1','ICOS',
+            'CD40LG','FOXP3','IL2RA','OAS1','ISG15','IFI44L','GZMA','GZMB','GZMH','GZMM','TRDV2','TRAV1-2','KLRB1','SLC4A10',
+            'NKG7', 'FCGR3A','NCAM1','CD19','MS4A1','IGHM','FCRL5','IRF4','PRDM1','CD38','CST3','LYZ','CD14','CLEC4C','IL3RA',
+            'XCR1', 'CLEC9A','CD1C','FCER1A','IL7R','IL18R1','IL23R','CD34','MKI67')
+DotPlot(data, features = Markers) +coord_flip()
+new.cluster.ids <- c(`0` = "CD4_Tcm", 
+                     `1` = "Th17_CD4_Tcm",
+                     `2` = "CD14_Mono", 
+                     `3` = "KLRG1_CD4_Tcm", 
+                     `4` = "CD16_NK",
+                     `5` = "IgM_B_mem",
+                     `6` = "switched_B_mem",
+                     `7` = "Treg_CD4", 
+                     `8` = "CD8_cytotoxic", 
+                     `9` = "Th2_CD4_Tcm",
+                     `10` = "CD8_Tcm",
+                     `11` = "vd2_gdT",
+                     `12` = "MAIT",
+                     `13` = "CD56_NK",
+                     `14` = "CD14_Mono",
+                     `15` = "CD16_Mono",
+                     `16` = "Th2_CD4_Tcm",
+                     `17` = "doublets",
+                     `18` = "ISG_CD4",
+                     `19` = "Tfh_CD4",
+                     `20` = "pDC",
+                     `21` = "Mixed_T_NK",
+                     `22` = "cDC1_cDC2",
+                     `23` = "B_Naive",
+                     `24` = "cycling",
+                     `25` = "ILC",
+                     `26` = "CD56low_CD16_NK",
+                     `27` = "CXCR3_CD4_Tcm",
+                     `28` = "plasmablast",
+                     `29` = "HSPC",
+                     `30` = "FCRL5_B_mem"
+                     )
+names(new.cluster.ids) <- levels(data)
+data <- RenameIdents(data, new.cluster.ids)
+DimPlot(data, reduction = "umap", label = TRUE, pt.size = 0.3) + NoLegend()
+head(data@meta.data)
+```
+# Subcluster DCs
+```{r subcluster}
+sub.cells <- subset(data, idents = "cDC1_cDC2")
+f = "obj.Rdata"
+if(!file.exists(f)){
+  sub.cells = sub.cells %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData(features = rownames(.)) %>%
+  RunPCA(features = VariableFeatures(.))  %>%
+  FindNeighbors(dims = 1:45) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:45) 
+  save(sub.cells,file = f)
+}
+load(f)
+DimPlot(sub.cells, reduction = 'umap',label = T)+NoLegend()
+sub.cells
+
+#Visualize marker genes
+DefaultAssay(sub.cells)<-"RNA"
+DC_markers<-c('CLEC9A','XCR1','FCER1A','CD1C')
+DotPlot(sub.cells,features = DC_markers) + RotatedAxis()
+
+#Annotate and put back to big umap
+sub.cells@meta.data$annotation <- ifelse(sub.cells@meta.data$seurat_clusters == 0, "cDC2", "cDC1")
+head(sub.cells@meta.data)
+data@meta.data$annotation = as.character(Idents(data))
+data@meta.data$annotation = ifelse(data@meta.data$annotation=="cDC1_cDC2",
+       sub.cells@meta.data$annotation[match(colnames(data@meta.data),colnames(sub.cells@meta.data))],
+       data@meta.data$annotation)
+Idents(data) = data@meta.data$annotation
+DimPlot(data,reduction = "umap", label = T, pt.size = 0.3, label.size = 3)
+table(data@meta.data$annotation)
+
+saveRDS(data,"data/alldata_annotated.rds")
+```
+
+
+#Subset Lymph node data for Xenium reference
+
+```{r subset LN}
+LN <- subset(data, subset = tissue == "lymph node")
+saveRDS(LN,"data/LN_annotated.rds")
+```
+
+# Write Lymph node data to MEX format and export annotation
+You can find guideline here [Creating single cell references for Xenium Custom Panel Design from Seurat or AnnData](https://www.10xgenomics.com/analysis-guides/creating-single-cell-references-for-xenium-custom-panel-design-from-seurat-or-anndata)
+```{r}
+LN <- readRDS("data/LN_annotated.rds")
+
+DefaultAssay(LN)<-"RNA"
+all.equal(GetAssayData(object=LN, assay="RNA", slot="counts")@x, as.integer(GetAssayData(object=LN, assay="RNA", slot="counts")@x))
+head(GetAssayData(object=LN, assay="RNA", layer="counts")@x)
+head(LN@assays$RNA@meta.data$ensembl)
+dplyr::glimpse(GetAssay(LN)@meta.data)
+
+write10xCounts(
+  "reference_data",
+  GetAssayData(LN, assay = "RNA", layer="counts"),
+  gene.id = LN@assays$RNA@meta.data$ensembl,
+  gene.symbol = LN@assays$RNA@meta.data$geneID,
+  barcodes = colnames(LN),
+  type = "sparse",
+  version = "3"
+)
+
+metadata <- LN@meta.data
+output <- data.frame(Barcode = rownames(metadata), 
+                     Annotation = metadata$annotation)
+head(output)
+write.csv(output, file = "reference_data/cell_type_annotations.csv", row.names = FALSE)
+list.files("reference_data")
+```
+
+# Session info
+```{r session info}
+sessionInfo()
+```
