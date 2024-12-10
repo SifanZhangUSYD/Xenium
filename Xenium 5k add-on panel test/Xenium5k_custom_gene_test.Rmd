@@ -1,0 +1,179 @@
+---
+title: "Xenium5k_custom_gene_test"
+author: "Sifan Zhang"
+date: "2024-12-02"
+output: html_document
+---
+**This script is for testing how 100 add-on genes looks like with Xenium 5k panel**
+Will substrate genes from public dataset, so the results really depends on what dataset you are using
+
+# Prepare  r packages
+
+```{r libraries, warning=FALSE, message = FALSE}
+library(SeuratObject)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(harmony)
+```
+
+# Set up R environment
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message=F, warning=F)
+
+# sets the directory of all chunks to the directory of this script
+knitr::opts_knit$set(root.dir = "M:/SifanZ/OneDrive - Westmead Institute for Medical Research/Data/scRNA_LN/GSE254435/Xenium5k")
+
+theme_set(theme_classic())
+set.seed(1337)
+```
+
+# Load integrated public dataset
+Loading and integration need to be done prior to this workflow
+```{r loading data}
+LN <- readRDS("M:/SifanZ/OneDrive - Westmead Institute for Medical Research/Data/scRNA_LN/GSE254435/Xenium5k/LN_annotated.rds")
+LN
+DimPlot(LN,reduction = "umap", label=T)+NoLegend()
+```
+# Calculate overlap genes between 5101 gene panel and this dataset
+You need to determine final add-on gene list using [Xenium panel designer](https://cloud.10xgenomics.com/xenium-panel-designer) 
+```{r overlap}
+xenium5k <- read.csv("XeniumPrimeHuman5Kpan_tissue_pathways_metadata.csv")
+head(xenium5k)
+length(rownames(xenium5k))
+
+addgenes <- read.csv("gene_list.csv")
+head(addgenes)
+length(rownames(addgenes))
+
+allgenes<-LN@assays$RNA@meta.data$ensembl
+
+xenium5kgenes<-xenium5k$gene_id
+addgenes<- addgenes$Ensembl.ID
+custom_genes <- c(xenium5kgenes, addgenes)
+length(custom_genes)
+
+commongenes<-intersect(allgenes,custom_genes)
+length(commongenes)
+
+subset_meta.data<-LN@assays$RNA@meta.data %>% filter(ensembl %in% commongenes)
+LN_5k <- subset(LN, features = subset_meta.data$geneID)
+length(rownames(LN_5k))
+LN_5k
+
+saveRDS(LN_5k, "LN_4204_genes.rds")
+```
+
+**NOTE:** from the results you can see that not all genes are overlapped, which means some genes in 5k panel are not found in the public dataset, this could due to QC steps which excluded some low-quality cells.
+In Xenium panel designer this means some genes are not found in your dataset, therefore can't design probes. In order to fix this, you can upload single, pre-QC dataset, which contains all genes in there.
+
+# Re-do dimentional reduction using 4204 genes
+Integration using Seurat v5 can be found in [seurat5_integration](https://satijalab.org/seurat/articles/seurat5_integration)
+
+```{r pca}
+LN_5k <- readRDS("LN_4204_genes.rds")
+DefaultAssay(LN_5k)<-"RNA"
+
+LN_5k[["RNA"]] <- split(LN_5k[["RNA"]], f = LN_5k$donor)
+LN_5k <- NormalizeData(LN_5k,verbose=F)
+LN_5k <- FindVariableFeatures(LN_5k,verbose=F)
+LN_5k <- ScaleData(LN_5k,verbose=F)
+LN_5k <- RunPCA(LN_5k,verbose=F)
+
+# checking unintegrated analysis
+LN_5k <- FindNeighbors(LN_5k, dims = 1:45, reduction = "pca",verbose=F)
+LN_5k <- FindClusters(LN_5k, resolution = 1.2, cluster.name = "unintegrated_clusters",verbose=F)
+LN_5k <- RunUMAP(LN_5k, dims = 1:45, reduction = "pca", reduction.name = "umap.5k.unintegrated",verbose=F)
+
+#integrating data
+LN_5k <- IntegrateLayers(object = LN_5k, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony.5K", verbose = T)
+LN_5k[["RNA"]] <- JoinLayers(LN_5k[["RNA"]])
+
+LN_5k <- FindNeighbors(LN_5k, reduction = "harmony.5K", dims = 1:45,verbose=F)
+LN_5k <- FindClusters(LN_5k, resolution = 1.2,verbose=F)
+LN_5k <- RunUMAP(LN_5k, dims = 1:45, reduction = "harmony.5K",reduction.name = "umap.5k.integrated",verbose=F)
+
+LN_5k
+saveRDS(LN_5k,"LN_5k_new_integration.rds")
+
+```
+
+# Comparison between unintegrated vs. integrated 
+
+```{r}
+LN_5k <- readRDS("LN_5k_new_integration.rds")
+LN_5k
+plot_grid(
+  DimPlot(LN_5k, reduction = "umap.5k.integrated", group.by = "donor", label=T)+ggtitle("harmony.5k"),
+  DimPlot(LN_5k, reduction = "umap.5k.unintegrated", group.by = "donor", label=T)+ggtitle("No Int.5k")
+)
+  DimPlot(LN_5k, reduction = "umap.5k.integrated", label=T)
+  
+FetchData(LN_5k, c("ident","sample")) %>% group_by(ident) %>%
+    mutate(prop=1/length(ident)) %>%
+    ungroup() %>%
+    group_by(ident,sample) %>%
+    summarise(totprop=sum(prop), .groups = "drop") %>%
+    ggplot(aes(x=ident,fill=sample,y=totprop)) +
+    geom_bar(position='fill', stat='identity') + 
+    theme(axis.text.x =element_text(angle = 45,hjust=1))+scale_y_continuous(name="Cluster Proportion")+ theme_classic()
+
+FetchData(LN_5k, c("ident","donor")) %>% group_by(ident) %>%
+    mutate(prop=1/length(ident)) %>%
+    ungroup() %>%
+    group_by(ident,donor) %>%
+    summarise(totprop=sum(prop),.groups = "drop") %>%
+    ggplot(aes(x=ident,fill=donor,y=totprop)) +
+    geom_bar(position='fill', stat='identity') + 
+    theme(axis.text.x =element_text(angle = 45,hjust=1))+scale_y_continuous(name="Cluster Proportion")+ theme_classic()
+
+
+```
+# Use Dotplot to visualize gene expression, and annotate clusters 
+note: always set default assay to 'RNA' when looking at gene expression
+From the UMAP we can see the current resolution can't seperate cDC1 and cDC2, needs to be improved later
+```{r expression, message=TRUE}
+DefaultAssay(LN_5k) <- "RNA"
+Markers <- c('CD3E','CD4','CD8A','SELL','CCR7','TCF7','GATA3','CCR4','CXCR3','KLRG1','RORC','CCR6','CXCR5','PDCD1','ICOS','CD40LG','FOXP3','IL2RA','OAS1','ISG15','IFI44L','GZMA','GZMB','GZMH','GZMM','TRDV2','TRAV1-2','KLRB1','SLC4A10','NKG7','FCGR3A','NCAM1','CD19','MS4A1','IGHM','FCRL5','IRF4','PRDM1','CD38','CST3','LYZ','CD14','CLEC4C','IL3RA','XCR1','CLEC9A','CD1C','FCER1A','IL7R','IL18R1','IL23R','CD34','MKI67')
+DotPlot(LN_5k, features = Markers) +coord_flip()
+new.cluster.ids <- c(`0` = "Th2_CD4_Tcm", 
+                     `1` = "CD4_Tcm",
+                     `2` = "IgM_B_mem", 
+                     `3` = "switched_B_mem", 
+                     `4` = "Treg_CD4",
+                     `5` = "CD8_mem",
+                     `6` = "CD56_NK",
+                     `7` = "CD38_NK", 
+                     `8` = "CD16_NK", 
+                     `9` = "Th17_CD4_Tcm",
+                     `10` = "Tfh_CD4",
+                     `11` = "CD14_Mono",
+                     `12` = "pDC",
+                     `13` = "ISG_CD4",
+                     `14` = "ILC",
+                     `15` = "B_Naive",
+                     `16` = "cDC",
+                     `17` = "cycling",
+                     `18` = "FCRL5_B_mem",
+                     `19` = "CXCR3_CD4_Tcm",
+                     `20` = "plasmablast"
+                     )
+names(new.cluster.ids) <- levels(LN_5k)
+LN_5k <- RenameIdents(LN_5k, new.cluster.ids)
+DimPlot(LN_5k, reduction = "umap.5k.integrated", label = TRUE, pt.size = 0.3) + NoLegend()
+
+```
+# Visualize inflammasome genes
+This doesn't make sense without comparison though.
+
+```{r}
+inflammasome_genes <- c("NLRP1","NLRP3","CASP1","CASP4","CASP5","MEFV","PYCARD","APP","TXN")
+DotPlot(LN_5k, features = inflammasome_genes)
+DotPlot(LN_5k, features = inflammasome_genes, group.by = "donor")
+```
+
+
+**From the umap we can see we lost 10 clusters by subsetting genes, next step will try annotating clusters using reference datasets or online tool**
